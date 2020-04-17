@@ -1,52 +1,58 @@
 package ExtUtils::ParseVersion;
 use strict;
 use warnings;
+require 5.006;
+use version;
 
 our $VERSION = '0.001000';
 $VERSION =~ tr/_//d;
-
-require 5.006;
-use strict;
-use warnings;
-use version qw(qv);
 
 use Exporter (); BEGIN { *import = \&Exporter::import }
 
 our @EXPORT_OK = qw(parse_version);
 
-#my $v = qr{[v-]?[0-9._]+};
 
-our $VSTRING_V_RE = qr{
-  v[0-9][0-9_]*(?:\.[0-9_]+)*
+my $VSTRING_V_RE = qr{
+  v[0-9][0-9_]*(?:\.[0-9][0-9_]*)*
   |
-  ((?:(?!_)[0-9_]*[0-9])?\.)(?:\.[0-9_]+){2,}
+  (?:[0-9][0-9_]*)?(?:\.[0-9][0-9_]*){2,}
 }x;
-our $NUMERIC_V_RE = qr{
-  [0-9][0-9_]*(?:\.[0-9_]*)?
+my $NUMERIC_V_RE = qr{
+  -?[0-9][0-9_]*(?:\.[0-9_]*)?
   |
-  \.[0-9][0-9_]*
+  -?\.[0-9][0-9_]*
 }x;
 
-our $VERSION_RE = qr/
+my $VERSION_RE = qr{
   $VSTRING_V_RE
   |
   $NUMERIC_V_RE
-/;
-#our $VERSION_RE = qr/v?[0-9._]+/;
-our $PACKAGE_RE = qr/\w[\w\:\']*/;
-#our $PACKAGE_RE = qr/[a-zA-Z_]\w*(?:(?:::|')\w+/;
+}x;
+#my $VERSION_RE = qr{[v-]?[0-9._]+};
+#my $VERSION_RE = qr/v?[0-9._]+/;
+
+my $STRICT_V_RE = qr{
+  v(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]{0,2})){2,}
+  |
+  (?:0|[1-9][0-9]*)\.[0-9]+
+}x;
+
+my $PACKAGE_RE = qr/(?![0-9])\w+(?:(?:::|')\w+)*/;
+#my $PACKAGE_RE = qr/\w[\w\:\']*/;
 
 # matches package, optional version
 our $PACKAGE_STATEMENT_RE = qr{
-    ^[\s\{;]*
+    (?:^|\{|;)
+    \s*
     package
     \s+
     ($PACKAGE_RE)
     \s*
     \b($VERSION_RE)?
     \s*
-    [;\{]
+    (?:$|\{|;)
 }mx;
+# should be $STRICT_V_RE, not $VERSION_RE
 
 # matches sigil, variable, optional package
 our $VERSION_VAR_RE = qr{
@@ -83,15 +89,15 @@ my %vpm_declare = (
 );
 # matches version call, (quoting character, version) pairs
 our $VERSION_PM_RE = qr{
-    (
-        (?:\bversion::)\bqv
+    (?:
+        \b(?:version::)?qv
     |
-        (?:'version'|\bversion(?:::)?|"version") \s* -> \s* (?:new|parse|declare)
+        (?:\bversion(?:::)?|"version"|'version') \s* -> \s* (?:new|parse|declare)
     )
     \s* \( \s*
     $QUOTED_VERSION_RE
     \s* \)
-};
+}x;
 
 sub _reader {
     my $file = shift;
@@ -116,16 +122,51 @@ sub _reader {
         };
     }
     my $fh;
+    my $pre = '';
     if (ref $fh) {
         $fh = $file;
     }
     else {
         open $fh, '<', $file or die "can't read $file: $!";
+        $pre = _handle_bom($file);
     }
     return sub {
         local $/ = "\n";
-        readline $fh;
+        if (defined $pre) {
+            my $out = $pre . readline $fh;
+            undef $pre;
+            return $out;
+        }
+        return readline $fh;
     };
+}
+
+sub _handle_bom {
+    my ($fh) = @_;
+
+    my $encoding;
+    my $count = read $fh, my $buf, 2;
+    if ($count == 2) {
+        if ( $buf eq "\x{FE}\x{FF}" ) {
+            $encoding = 'UTF-16BE';
+        }
+        elsif ( $buf eq "\x{FF}\x{FE}" ) {
+            $encoding = 'UTF-16LE';
+        }
+        elsif ( $buf eq "\x{EF}\x{BB}" ) {
+            $count = read $fh, $buf, 1, 2;
+            if ( defined $count and $count == 1 and $buf eq "\x{EF}\x{BB}\x{BF}" ) {
+                $encoding = 'UTF-8';
+            }
+        }
+    }
+    if (defined $encoding) {
+        binmode $fh, ":encoding($encoding)";
+        return '';
+    }
+    else {
+        return $buf;
+    }
 }
 
 sub parse_module_version {
@@ -145,16 +186,19 @@ sub parse_version {
     my ($parsefile, %opts) = @_;
 
     my $all           = $opts{all};
+    my $stop_at_end   = $opts{stop_at_end};
 
     my $read = _reader($parsefile);
 
     my $inpod = 0;
     my @results;
+    my %versions;
     my $last_package;
 
     while (my $line = $read->()) {
+        chomp $line;
         if ($line =~ /^=/) {
-            $inpod = $line = /^=cut/;
+            $inpod = $line =~ /^=cut/;
             next;
         }
         if ($inpod
@@ -163,13 +207,16 @@ sub parse_version {
         ) {
             next;
         }
-
-        chomp $line;
+        if ($stop_at_end && ($line eq '__END__' || $line eq '__DATA__')) {
+            last;
+        }
 
         if ( $line =~ m/$PACKAGE_STATEMENT_RE/m ) {
             my ($package, $version) = ($1, $2);
             if (defined $version) {
-                push @results, [ $package, $version ];
+                # $version = _normalize_raw_version($version);
+                push @results, $package, $version;
+                $versions{$package} = $version;
                 last
                     if !$all;
             }
@@ -179,10 +226,15 @@ sub parse_version {
         }
         elsif ( $line =~ m/$VERSION_STATEMENT_RE/m ) {
             my ($sigil, $variable, $package) = ($1, $2, $3);
-            my ($version_package, @versions)
-                = _get_version($line, $sigil, $variable, $package || $last_package || 'main', \%opts);
+            my $try_package = $package || $last_package || 'main';
+            if (defined $versions{$try_package}) {
+                next;
+            }
+            my ($version_package, $version)
+                = _get_version($line, $sigil, $variable, $try_package, \%opts);
             if (defined $version_package) {
-                push @results, [ $version_package, @versions ];
+                push @results, $version_package, $version;
+                $versions{$version_package} = $version;
                 last
                     if !$all;
             }
@@ -194,7 +246,7 @@ sub parse_version {
 
 sub _normalize_raw_version {
     my $version = shift;
-    if ($version =~ /v/ || $version =~ tr/.// > 1) {
+    if ($version !~ /v/ && $version =~ tr/.// < 2) {
         $version =~ s/_//g;
         $version += 0;
     }
@@ -204,22 +256,43 @@ sub _normalize_raw_version {
 sub _get_version {
     my ($line, $sigil, $variable, $package, $opts) = @_;
 
-    my $eval_parse    = exists $opts->{allow_eval} ? $opts->{allow_eval} : 0;
-    my $safe_parse    = exists $opts->{allow_safe} ? $opts->{allow_safe} : 1;
+    my $allow_eval    = exists $opts->{allow_eval} ? $opts->{allow_eval} : 0;
+    my $allow_safe    = exists $opts->{allow_safe} ? $opts->{allow_safe} : 1;
     my $parse_cb      = $opts->{parse_cb};
 
+    my @try = (
+        \&_static_version,
+        ($parse_cb    ? $parse_cb : ()),
+        ($allow_safe  ? \&_safe_eval_version : ()),
+        ($allow_eval  ? \&_eval_version : ()),
+    );
+
+    for my $try (@try) {
+        my ($parse_package, $version) = $try->($line, $sigil, $variable, $package);
+        if (defined $parse_package) {
+              return ($parse_package, $version);
+        }
+    }
+    return;
+}
+
+sub _static_version {
+    my ($line, $sigil, $variable, $package) = @_;
+
     if ($line =~ m{
-        ^
+        (?:;|\{|^)
         \s*
         (?:our)? \s*
         \Q${sigil}${variable}\E
         \s* = \s*
         (.+?)
-        (?:;|#|$)
+        \s*
+        (?:;|$|\}|\#)
     }mx) {
-        my ($assign) = ($1);
-        if ($sigil eq '*' ) {
+        my $assign = $1;
+        if ($sigil eq '*') {
             $assign =~ s/\A\\//
+                or return;
         }
         if (my @match = $assign =~ m{\A\s*$QUOTED_VERSION_RE\s*\z}) {
             my ($version, $quote) = grep defined, reverse @match;
@@ -227,49 +300,34 @@ sub _get_version {
             return ($package, $version);
         }
         if (my @match = $assign =~ m{\A\s*$VERSION_PM_RE\s*\z}) {
-            my ($vcall, $version, $quote) = grep defined, reverse @match;
+            my ($version, $quote) = grep defined, reverse @match;
             $version = _normalize_raw_version($version) if !$quote;
-            $vcall =~ /->/ and $vcall =~ s/[\s'":]//g;
-            if ($vpm_declare{$vcall}) {
+            if ($assign =~ /declare|qv/) {
                 $version =~ s/\Av?/v/;
             }
+            require version;
+            $version = version->new($version);
             return ($package, $version);
         }
     }
-
-    if ($parse_cb) {
-        my ($parse_package, $version) = $parse_cb->($line, $sigil, $variable, $package);
-        return ($parse_package, $version);
-    }
-
-    if ($safe_parse) {
-        my ($parse_package, $version) = _safe_eval_version($sigil, $variable, $line);
-        return ($package, $version);
-    }
-
-    if ($eval_parse) {
-        my ($parse_package, $version) = _eval_version($sigil, $variable, $line);
-        return ($package, $version);
-    }
-
     return;
 }
 
 sub _eval_version {
-    my ($sigil, $name, $line) = @_;
+    my ($line, $sigil, $variable, $package) = @_;
 
     $line =~ m{^(.+)}s and $line = $1;
 
     package #hide
         ExtUtils::MakeMaker::_version;
+    no strict 'refs';
+    no warnings;
     undef *version; # in case of unexpected version() sub
     eval {
         require version;
         version::->import;
     };
-    no strict 'refs';
-    no warnings;
-    local *{$name};
+    local *{$variable};
     my $e;
     {
         local $@;
@@ -281,38 +339,39 @@ sub _eval_version {
     if (defined $e) {
         return;
     }
-    return $$name;
+    return ($package, $$variable);
 }
 
 sub _safe_eval_version {
-    my ($sigil, $name, $line) = @_;
+    my ($line, $sigil, $variable, $package) = @_;
     require Safe;
-    require version;
+    { local $@; eval { require version } }
 
     my $comp = Safe->new;
-    $comp->permit("entereval"); # for MBARBON/Module-Info-0.30.tar.gz
-    $comp->share("*version::new");
-    $comp->share("*version::numify");
+    $comp->permit(qw(entereval :base_math));
+    $comp->deny(qw(enteriter iter unstack goto));
+    no strict 'refs';
     $comp->share_from('main', [
-        '*version::',
-        '*Exporter::',
-        '*DynaLoader::',
+        map {
+            my $pack = $_;
+            map "*${pack}::$_", grep !/^::/, keys %{"${pack}::"};
+        } qw(charstar version version::vpp version::vxs version::regex)
     ]);
     $comp->share_from('version', [
         '&qv'
     ]);
     my $code = <<"END_CODE";
-    local $sigil$name;
+    local $sigil$variable;
     {;
         $line
     }
-    \$$name;
+    \$$variable;
 END_CODE
     my $result = $comp->reval($code);
     if ($@) {
         return;
     }
-    return $result;
+    return ($package, $result);
 }
 
 1;
@@ -383,6 +442,7 @@ unsafe.
 Defaults to false.
 
 =back
+
 =head1 AUTHOR
 
 haarg - Graham Knop (cpan:HAARG) <haarg@haarg.org>

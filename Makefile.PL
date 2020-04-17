@@ -40,6 +40,8 @@ my %META = (
   no_index => {
     directory => [ 't', 'xt' ]
   },
+  x_static_install => 1,
+  dynamic_config => 0,
   x_breaks => {
   },
   x_authority => 'cpan:HAARG',
