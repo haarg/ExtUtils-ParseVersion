@@ -2,7 +2,28 @@ use strict;
 use warnings;
 use Test::More;
 
-use List::Util qw(sum);
+use ExtUtils::MakeMaker;
+use ExtUtils::ParseVersion;
+
+use lib 't/lib';
+
+use DatReader qw(each_dat_code);
+
+each_dat_code {
+  my ($file, $code) = @_;
+  warn $file;
+  warn $code;
+  exit;
+};
+
+done_testing;
+
+__END__
+
+
+
+
+
 use ExtUtils::MakeMaker;
 use ExtUtils::ParseVersion qw(parse_version);
 use version ();
